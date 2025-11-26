@@ -359,28 +359,26 @@ async fn main() {
     let command = args.command.as_ref().expect("command is required");
 
     // Show platform-specific warnings
-    if !Platform::IS_LINUX {
-        if args.cpu_limit().is_some() || args.mem_limit().is_some() {
-            eprintln!(
-                "{}: Running on {}. Some features may have limited support.",
-                "Warning".yellow(),
-                Platform::name()
-            );
+    if !Platform::IS_LINUX && (args.cpu_limit().is_some() || args.mem_limit().is_some()) {
+        eprintln!(
+            "{}: Running on {}. Some features may have limited support.",
+            "Warning".yellow(),
+            Platform::name()
+        );
 
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly")))]
-            {
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly")))]
+        {
+            eprintln!(
+                "{}: Resource limits (--cpu-limit, --mem-limit) not supported on this platform",
+                "Warning".yellow()
+            );
+            if args.cpu_limit().is_some() || args.mem_limit().is_some() {
                 eprintln!(
-                    "{}: Resource limits (--cpu-limit, --mem-limit) not supported on this platform",
-                    "Warning".yellow()
+                    "{}: Resource limits requested but not available on {}",
+                    "Error".red(),
+                    Platform::name()
                 );
-                if args.cpu_limit().is_some() || args.mem_limit().is_some() {
-                    eprintln!(
-                        "{}: Resource limits requested but not available on {}",
-                        "Error".red(),
-                        Platform::name()
-                    );
-                    exit(EXIT_CANCELED);
-                }
+                exit(EXIT_CANCELED);
             }
         }
     }
