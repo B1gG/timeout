@@ -92,10 +92,8 @@ pub async fn run_with_timeout(
             // Linux-specific: Setup PR_SET_PDEATHSIG
             #[cfg(target_os = "linux")]
             {
-                unsafe {
-                    if let Err(_) = unsafe { prctl(PR_SET_PDEATHSIG, Signal::SIGKILL as i32) } {
-                        eprintln!("{}: failed to set parent death signal", "Warning".yellow());
-                    }
+                if unsafe { prctl(PR_SET_PDEATHSIG, Signal::SIGKILL as i32) } == -1 {
+                    eprintln!("{}: failed to set parent death signal", "Warning".yellow());
                 }
             }
 
@@ -113,7 +111,7 @@ pub async fn run_with_timeout(
             #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly"))]
             {
                 if let Some(cpu_secs) = cpu_limit {
-                    if let Err(e) = setrlimit(Resource::RLIMIT_CPU, cpu_limit, cpu_limit) {
+                    if let Err(e) = setrlimit(Resource::RLIMIT_CPU, cpu_secs, cpu_secs) {
                         eprintln!("{}: failed to set CPU limit: {}", "Warning".yellow(), e);
                     }
                 }
