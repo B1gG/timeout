@@ -1,0 +1,16 @@
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Testing
+*.log
+test_output/

@@ -5,10 +5,10 @@
 /target
 **/*.rs.bk
 **/*.rs.bak
-Cargo.lock
 # NOTE: 
-#   - For BINARY projects (executables): keep Cargo.lock IGNORED (as above).
-#   - For LIBRARY projects: COMMENT OUT the line above to TRACK Cargo.lock.
+#   - For BINARY projects (executables): Cargo.lock should be TRACKED for reproducible builds.
+#   - For LIBRARY projects: Cargo.lock should be IGNORED.
+#   - This is a binary project, so Cargo.lock is tracked.
 
 # ======================
 # Rust Analyzer
