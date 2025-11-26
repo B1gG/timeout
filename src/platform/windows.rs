@@ -171,7 +171,6 @@ pub async fn run_with_timeout(
                 }
             }
 
-            #[cfg(windows)]
             _ = ctrl_c_stream.recv() => {
                 if verbose {
                     eprintln!("{}: Received Ctrl+C for timeout process. Terminating child.", "Signal".yellow());
