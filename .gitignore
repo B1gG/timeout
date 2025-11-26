@@ -1,1 +1,57 @@
+# ======================
+# Rust
+# ======================
+/target/
 /target
+**/*.rs.bk
+**/*.rs.bak
+Cargo.lock
+# NOTE: 
+#   - For BINARY projects (executables): keep Cargo.lock IGNORED (as above).
+#   - For LIBRARY projects: COMMENT OUT the line above to TRACK Cargo.lock.
+
+# ======================
+# Rust Analyzer
+# ======================
+# Rust Analyzer sometimes creates these in the project root
+rust-project.json
+# Also ignore any RA-specific metadata (though usually stored in target/)
+# No need to ignore target/ra/ — it's already covered by /target/
+
+# ======================
+# VS Code
+# ======================
+.vscode/
+# Optional: UNCOMMENT lines below to SHARE config with your team
+# !.vscode/settings.json
+# !.vscode/tasks.json
+# !.vscode/launch.json
+# !.vscode/extensions.json
+
+# ======================
+# Temporary Folders & Files
+# ======================
+temp/
+temp/**
+tmp/
+tmp/**
+*.tmp
+*.temp
+
+# ======================
+# OS & Editor Junk
+# ======================
+.DS_Store          # macOS
+Thumbs.db          # Windows
+*.swp              # Vim
+*.swo
+*~                 # Backup files (Emacs, gedit, etc.)
+
+# ======================
+# Ignore Certificates
+# ======================
+*.crt
+*.pem
+*.key
+*.der
+

@@ -1,27 +1,28 @@
-use clap::Parser;
-use nix::sys::signal::{kill, killpg, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, setpgid, ForkResult, Pid};
+// src/main.rs
+// Main entry point and shared utilities for timeout command
+
+mod args;
+mod platform;
+
+use args::Args;
+use clap::{CommandFactory, Parser};
+use clap_complete::{generate, Shell};
+use owo_colors::OwoColorize;
 use std::fmt;
-use std::os::unix::process::CommandExt;
-use std::process::{exit, Command};
-use std::time::{Duration, Instant};
+use std::io;
+use std::process::exit;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::signal::unix::{signal, SignalKind};
 
-// Platform-specific imports
-#[cfg(target_os = "linux")]
-use nix::libc::{prctl, PR_SET_DUMPABLE, PR_SET_PDEATHSIG};
-
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly"))]
-use nix::libc::RLIM_INFINITY;
-
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly"))]
-use nix::sys::resource::{setrlimit, Resource};
+#[cfg(unix)]
+use nix::sys::signal::{kill, killpg, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 
 /// Custom error types for timeout operations
 #[derive(Error, Debug)]
 pub enum TimeoutError {
+    #[cfg(unix)]
     #[error("failed to fork process: {0}")]
     ForkFailed(#[from] nix::Error),
 
@@ -51,9 +52,11 @@ pub enum TimeoutError {
         source: std::io::Error,
     },
 
+    #[cfg(unix)]
     #[error("failed to create process group: {0}")]
     ProcessGroupFailed(nix::Error),
 
+    #[cfg(unix)]
     #[error("failed to send signal {signal} to process: {source}")]
     SignalSendFailed {
         signal: String,
@@ -86,6 +89,7 @@ impl Platform {
     pub const IS_OPENBSD: bool = cfg!(target_os = "openbsd");
     pub const IS_NETBSD: bool = cfg!(target_os = "netbsd");
     pub const IS_DRAGONFLY: bool = cfg!(target_os = "dragonfly");
+    pub const IS_WINDOWS: bool = cfg!(windows);
 
     pub const HAS_PRCTL: bool = cfg!(target_os = "linux");
     pub const HAS_RLIMIT_AS: bool = cfg!(any(
@@ -107,16 +111,20 @@ impl Platform {
             "NetBSD"
         } else if Self::IS_DRAGONFLY {
             "DragonFly BSD"
+        } else if Self::IS_WINDOWS {
+            "Windows"
         } else {
-            "Unknown Unix"
+            "Unknown"
         }
     }
 }
 
-/// Type-safe signal wrapper
+/// Type-safe signal wrapper (Unix only)
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimeoutSignal(Signal);
+pub struct TimeoutSignal(pub Signal);
 
+#[cfg(unix)]
 impl TimeoutSignal {
     pub fn from_str_or_num(s: &str) -> Result<Self, TimeoutError> {
         let sig = match s.to_uppercase().as_str() {
@@ -161,13 +169,26 @@ impl TimeoutSignal {
     }
 
     pub fn send_to_group(&self, pgid: Pid) -> Result<(), TimeoutError> {
-        killpg(pgid, self.0).map_err(|e| TimeoutError::SignalSendFailed {
-            signal: self.as_str().to_string(),
-            source: e,
-        })
+        // Try killpg first (process group signal)
+        match killpg(pgid, self.0) {
+            Ok(()) => Ok(()),
+            Err(nix::errno::Errno::ESRCH) => {
+                // On macOS, killpg may fail with ESRCH even when the process exists
+                // Fall back to killing the process directly
+                kill(pgid, self.0).map_err(|e| TimeoutError::SignalSendFailed {
+                    signal: self.as_str().to_string(),
+                    source: e,
+                })
+            }
+            Err(e) => Err(TimeoutError::SignalSendFailed {
+                signal: self.as_str().to_string(),
+                source: e,
+            }),
+        }
     }
 }
 
+#[cfg(unix)]
 impl fmt::Display for TimeoutSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
@@ -181,7 +202,10 @@ pub struct TimeoutMetrics {
     pub duration: Duration,
     pub timed_out: bool,
     pub exit_code: i32,
+    #[cfg(unix)]
     pub signal_sent: Option<TimeoutSignal>,
+    #[cfg(not(unix))]
+    pub signal_sent: Option<String>,
     pub elapsed: Duration,
     pub kill_after_used: bool,
     pub cpu_limit: Option<u64>,
@@ -193,13 +217,18 @@ pub struct TimeoutMetrics {
 impl TimeoutMetrics {
     pub fn log(&self) {
         if std::env::var("TIMEOUT_METRICS").is_ok() {
+            #[cfg(unix)]
+            let signal_str = self.signal_sent.map(|s| s.as_str()).unwrap_or("none");
+            #[cfg(not(unix))]
+            let signal_str = self.signal_sent.as_deref().unwrap_or("none");
+
             eprintln!(
                 r#"{{"command":"{}","duration_ms":{},"timed_out":{},"exit_code":{},"signal":"{}","elapsed_ms":{},"kill_after_used":{},"cpu_limit":{},"memory_limit":{},"stopped_detected":{},"platform":"{}"}}"#,
                 self.command.replace('"', "\\\""),
                 self.duration.as_millis(),
                 self.timed_out,
                 self.exit_code,
-                self.signal_sent.map(|s| s.as_str()).unwrap_or("none"),
+                signal_str,
                 self.elapsed.as_millis(),
                 self.kill_after_used,
                 self.cpu_limit
@@ -215,63 +244,7 @@ impl TimeoutMetrics {
     }
 }
 
-/// Run a command with a time limit
-#[derive(Parser, Debug)]
-#[command(name = "timeout")]
-#[command(version = "1.0")]
-#[command(about = "Start COMMAND, and kill it if still running after DURATION", long_about = None)]
-struct Args {
-    /// Send this signal to COMMAND on timeout, rather than SIGTERM
-    #[arg(short = 's', long = "signal", value_name = "SIGNAL")]
-    signal: Option<String>,
-
-    /// Also send SIGKILL if COMMAND is still running after DURATION
-    #[arg(short = 'k', long = "kill-after", value_name = "DURATION")]
-    kill_after: Option<String>,
-
-    /// When not running timeout directly from a shell prompt,
-    /// allow COMMAND to read from the TTY and get TTY signals
-    #[arg(short = 'f', long = "foreground")]
-    foreground: bool,
-
-    /// Exit with the same status as COMMAND, even when the command times out
-    #[arg(long = "preserve-status")]
-    preserve_status: bool,
-
-    /// Diagnose to stderr any signal sent upon timeout
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-
-    /// Detect and report when process is stopped (SIGSTOP, SIGTSTP, etc.)
-    #[arg(long = "detect-stopped")]
-    detect_stopped: bool,
-
-    /// Limit CPU time in seconds (Linux/FreeBSD/DragonFly only)
-    #[arg(long = "cpu-limit", value_name = "SECONDS")]
-    cpu_limit: Option<u64>,
-
-    /// Limit memory usage (Linux/FreeBSD/DragonFly only)
-    /// Accepts values like "100M", "1G", "512K", or raw bytes
-    #[arg(long = "mem-limit", value_name = "SIZE")]
-    mem_limit: Option<String>,
-
-    /// Duration before timeout (e.g., 10s, 5m, 2h, 1d)
-    #[arg(value_name = "DURATION")]
-    duration: String,
-
-    /// Command to execute
-    #[arg(value_name = "COMMAND")]
-    command: String,
-
-    /// Arguments for the command
-    #[arg(value_name = "ARG", trailing_var_arg = true)]
-    args: Vec<String>,
-}
-
-const EXIT_TIMEDOUT: i32 = 124;
 const EXIT_CANCELED: i32 = 125;
-const EXIT_CANNOT_INVOKE: i32 = 126;
-const EXIT_ENOENT: i32 = 127;
 
 fn parse_duration(input: &str) -> Result<Duration, TimeoutError> {
     let input = input.trim();
@@ -361,20 +334,49 @@ fn parse_memory_limit(input: &str) -> Result<u64, TimeoutError> {
 async fn main() {
     let args = Args::parse();
 
+    // Handle shell completion generation
+    if let Some(shell_name) = &args.generate_completions {
+        let shell = match shell_name.to_lowercase().as_str() {
+            "bash" => Shell::Bash,
+            "zsh" => Shell::Zsh,
+            "fish" => Shell::Fish,
+            "powershell" => Shell::PowerShell,
+            "elvish" => Shell::Elvish,
+            _ => {
+                eprintln!("{}: unknown shell '{}'", "Error".red(), shell_name);
+                eprintln!("Supported shells: bash, zsh, fish, powershell, elvish");
+                exit(EXIT_CANCELED);
+            }
+        };
+
+        let mut cmd = Args::command();
+        generate(shell, &mut cmd, "timeout", &mut io::stdout());
+        return;
+    }
+
+    // Unwrap required fields (they're required when not generating completions)
+    let duration_str = args.duration.as_ref().expect("duration is required");
+    let command = args.command.as_ref().expect("command is required");
+
     // Show platform-specific warnings
     if !Platform::IS_LINUX {
-        if args.cpu_limit.is_some() || args.mem_limit.is_some() {
+        if args.cpu_limit().is_some() || args.mem_limit().is_some() {
             eprintln!(
-                "Warning: Running on {}. Some features may have limited support.",
+                "{}: Running on {}. Some features may have limited support.",
+                "Warning".yellow(),
                 Platform::name()
             );
 
             #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly")))]
             {
-                eprintln!("Warning: Resource limits (--cpu-limit, --mem-limit) not supported on this platform");
-                if args.cpu_limit.is_some() || args.mem_limit.is_some() {
+                eprintln!(
+                    "{}: Resource limits (--cpu-limit, --mem-limit) not supported on this platform",
+                    "Warning".yellow()
+                );
+                if args.cpu_limit().is_some() || args.mem_limit().is_some() {
                     eprintln!(
-                        "Error: Resource limits requested but not available on {}",
+                        "{}: Resource limits requested but not available on {}",
+                        "Error".red(),
                         Platform::name()
                     );
                     exit(EXIT_CANCELED);
@@ -383,14 +385,15 @@ async fn main() {
         }
     }
 
-    let duration = match parse_duration(&args.duration) {
+    let duration = match parse_duration(duration_str) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("timeout: {}", e);
+            eprintln!("{}: {}", "timeout".red(), e);
             exit(EXIT_CANCELED);
         }
     };
 
+    #[cfg(unix)]
     let term_signal = if let Some(sig_str) = &args.signal {
         match TimeoutSignal::from_str_or_num(sig_str) {
             Ok(sig) => sig,
@@ -402,6 +405,14 @@ async fn main() {
     } else {
         TimeoutSignal(Signal::SIGTERM)
     };
+
+    #[cfg(not(unix))]
+    if args.signal.is_some() {
+        eprintln!(
+            "Warning: --signal option not supported on {}",
+            Platform::name()
+        );
+    }
 
     let kill_after_duration = if let Some(ka) = &args.kill_after {
         match parse_duration(ka) {
@@ -415,7 +426,7 @@ async fn main() {
         None
     };
 
-    let mem_limit = if let Some(mem) = &args.mem_limit {
+    let mem_limit = if let Some(mem) = &args.mem_limit() {
         match parse_memory_limit(mem) {
             Ok(limit) => Some(limit),
             Err(e) => {
@@ -427,370 +438,50 @@ async fn main() {
         None
     };
 
-    match run_with_timeout(
-        &args.command,
+    #[cfg(unix)]
+    let result = platform::run_with_timeout(
+        command,
         &args.args,
         duration,
         term_signal,
         kill_after_duration,
-        args.foreground,
+        args.foreground(),
         args.preserve_status,
         args.verbose,
-        args.detect_stopped,
-        args.cpu_limit,
+        args.detect_stopped(),
+        args.no_notify(),
+        args.status_on_timeout,
+        args.cpu_limit(),
         mem_limit,
     )
-    .await
-    {
+    .await;
+
+    #[cfg(windows)]
+    let result = platform::run_with_timeout(
+        command,
+        &args.args,
+        duration,
+        kill_after_duration,
+        args.preserve_status,
+        args.verbose,
+        args.status_on_timeout,
+    )
+    .await;
+
+    #[cfg(not(any(unix, windows)))]
+    let result = {
+        eprintln!("{}: Platform not supported", "Error".red());
+        Err(TimeoutError::FeatureNotSupported(format!(
+            "Platform {} not supported",
+            Platform::name()
+        )))
+    };
+
+    match result {
         Ok(code) => exit(code),
         Err(e) => {
-            eprintln!("timeout: {}", e);
+            eprintln!("{}: {}", "timeout".red(), e);
             exit(EXIT_CANCELED);
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_with_timeout(
-    command: &str,
-    args: &[String],
-    duration: Duration,
-    term_signal: TimeoutSignal,
-    kill_after: Option<Duration>,
-    foreground: bool,
-    preserve_status: bool,
-    verbose: bool,
-    detect_stopped: bool,
-    cpu_limit: Option<u64>,
-    mem_limit: Option<u64>,
-) -> Result<i32, TimeoutError> {
-    let start_time = Instant::now();
-    let mut metrics = TimeoutMetrics {
-        command: command.to_string(),
-        duration,
-        timed_out: false,
-        exit_code: 0,
-        signal_sent: None,
-        elapsed: Duration::ZERO,
-        kill_after_used: false,
-        cpu_limit,
-        memory_limit: mem_limit,
-        stopped_detected: false,
-        platform: Platform::name(),
-    };
-
-    // Linux-specific: Disable core dumps
-    #[cfg(target_os = "linux")]
-    unsafe {
-        prctl(PR_SET_DUMPABLE, 0);
-    }
-
-    if !foreground {
-        setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(TimeoutError::ProcessGroupFailed)?;
-    }
-
-    let mut sigchld = signal(SignalKind::child()).map_err(|e| TimeoutError::SignalSetupFailed {
-        signal: "SIGCHLD".to_string(),
-        source: e,
-    })?;
-
-    let child_pid = match unsafe { fork() }? {
-        ForkResult::Parent { child } => child,
-        ForkResult::Child => {
-            // === Child process setup ===
-
-            // Linux-specific: Setup PR_SET_PDEATHSIG
-            #[cfg(target_os = "linux")]
-            {
-                unsafe {
-                    if prctl(PR_SET_PDEATHSIG, Signal::SIGKILL as i32) == -1 {
-                        eprintln!("timeout: warning: failed to set parent death signal");
-                    }
-                }
-
-                if getppid() != parent_pid_before_fork {
-                    exit(1);
-                }
-            }
-
-            // BSD/macOS: Warning about missing orphan prevention
-            #[cfg(not(target_os = "linux"))]
-            if verbose {
-                eprintln!(
-                    "timeout: note: orphan prevention (PR_SET_PDEATHSIG) not available on {}",
-                    Platform::name()
-                );
-            }
-
-            // Set resource limits (Linux/FreeBSD/DragonFly)
-            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly"))]
-            {
-                if let Some(cpu_secs) = cpu_limit {
-                    if let Err(e) = setrlimit(Resource::RLIMIT_CPU, cpu_secs, cpu_secs) {
-                        eprintln!("timeout: warning: failed to set CPU limit: {}", e);
-                    }
-                }
-
-                if let Some(mem_bytes) = mem_limit {
-                    // On Linux, use RLIMIT_AS (virtual memory)
-                    #[cfg(target_os = "linux")]
-                    let resource = Resource::RLIMIT_AS;
-
-                    // On BSD, RLIMIT_AS might not exist, use RLIMIT_DATA or RLIMIT_RSS
-                    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-                    let resource = Resource::RLIMIT_DATA;
-
-                    if let Err(e) = setrlimit(resource, mem_bytes, mem_bytes) {
-                        eprintln!("timeout: warning: failed to set memory limit: {}", e);
-                    }
-                }
-            }
-
-            // macOS/OpenBSD/NetBSD: Warning about resource limits
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly")))]
-            {
-                if cpu_limit.is_some() || mem_limit.is_some() {
-                    eprintln!(
-                        "timeout: warning: resource limits not fully supported on {}",
-                        Platform::name()
-                    );
-                }
-            }
-
-            let _ = unsafe {
-                nix::sys::signal::signal(Signal::SIGTTIN, nix::sys::signal::SigHandler::SigDfl)
-            };
-            let _ = unsafe {
-                nix::sys::signal::signal(Signal::SIGTTOU, nix::sys::signal::SigHandler::SigDfl)
-            };
-
-            // Linux-specific: Re-enable core dumps
-            #[cfg(target_os = "linux")]
-            unsafe {
-                prctl(PR_SET_DUMPABLE, 1);
-            }
-
-            let error = Command::new(command).args(args).exec();
-
-            let exit_code = match error.kind() {
-                std::io::ErrorKind::NotFound => EXIT_ENOENT,
-                std::io::ErrorKind::PermissionDenied => EXIT_CANNOT_INVOKE,
-                _ => EXIT_CANNOT_INVOKE,
-            };
-
-            eprintln!("timeout: failed to run command '{}': {}", command, error);
-            exit(exit_code);
-        }
-    };
-
-    // === Parent process ===
-
-    let mut sigint =
-        signal(SignalKind::interrupt()).map_err(|e| TimeoutError::SignalSetupFailed {
-            signal: "SIGINT".to_string(),
-            source: e,
-        })?;
-
-    let mut sigterm =
-        signal(SignalKind::terminate()).map_err(|e| TimeoutError::SignalSetupFailed {
-            signal: "SIGTERM".to_string(),
-            source: e,
-        })?;
-
-    let mut wait_flags = WaitPidFlag::WNOHANG;
-    if detect_stopped {
-        wait_flags |= WaitPidFlag::WUNTRACED;
-    }
-
-    let exit_code = tokio::select! {
-        _ = sigchld.recv() => {
-            metrics.elapsed = start_time.elapsed();
-
-            match waitpid(child_pid, Some(wait_flags)) {
-                Ok(WaitStatus::Stopped(_, sig)) if detect_stopped => {
-                    metrics.stopped_detected = true;
-                    if verbose {
-                        eprintln!("timeout: process stopped by signal {}", sig);
-                    }
-
-                    if !foreground {
-                        let _ = TimeoutSignal(Signal::SIGCONT).send_to_group(child_pid);
-                    } else {
-                        let _ = TimeoutSignal(Signal::SIGCONT).send_to_process(child_pid);
-                    }
-
-                    match waitpid(child_pid, None) {
-                        Ok(WaitStatus::Exited(_, code)) => {
-                            metrics.exit_code = code;
-                            metrics.log();
-                            code
-                        }
-                        Ok(WaitStatus::Signaled(_, sig, _)) => {
-                            let code = 128 + sig as i32;
-                            metrics.exit_code = code;
-                            metrics.log();
-                            code
-                        }
-                        _ => EXIT_CANCELED,
-                    }
-                }
-                Ok(WaitStatus::Exited(_, code)) => {
-                    metrics.exit_code = code;
-                    metrics.log();
-                    code
-                }
-                Ok(WaitStatus::Signaled(_, sig, _)) => {
-                    let code = 128 + sig as i32;
-                    metrics.exit_code = code;
-                    metrics.log();
-                    code
-                }
-                Ok(WaitStatus::StillAlive) => {
-                    match waitpid(child_pid, None) {
-                        Ok(WaitStatus::Exited(_, code)) => {
-                            metrics.exit_code = code;
-                            metrics.log();
-                            code
-                        }
-                        Ok(WaitStatus::Signaled(_, sig, _)) => {
-                            let code = 128 + sig as i32;
-                            metrics.exit_code = code;
-                            metrics.log();
-                            code
-                        }
-                        _ => EXIT_CANCELED,
-                    }
-                }
-                _ => EXIT_CANCELED,
-            }
-        }
-
-        _ = tokio::time::sleep(duration) => {
-            metrics.timed_out = true;
-            metrics.signal_sent = Some(term_signal);
-
-            if verbose {
-                eprintln!("timeout: sending signal {} to command '{}'", term_signal, command);
-            }
-
-            if foreground {
-                term_signal.send_to_process(child_pid)?;
-            } else {
-                term_signal.send_to_group(child_pid)?;
-            }
-
-            if !foreground {
-                let _ = TimeoutSignal(Signal::SIGCONT).send_to_group(child_pid);
-            }
-
-            if let Some(ka_duration) = kill_after {
-                metrics.kill_after_used = true;
-
-                tokio::select! {
-                    _ = sigchld.recv() => {
-                        metrics.elapsed = start_time.elapsed();
-
-                        let code = match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-                            Ok(WaitStatus::Exited(_, c)) => {
-                                if preserve_status { c } else { EXIT_TIMEDOUT }
-                            }
-                            Ok(WaitStatus::Signaled(_, sig, _)) => {
-                                if preserve_status { 128 + sig as i32 } else { EXIT_TIMEDOUT }
-                            }
-                            _ => EXIT_TIMEDOUT,
-                        };
-
-                        metrics.exit_code = code;
-                        metrics.log();
-                        code
-                    }
-
-                    _ = tokio::time::sleep(ka_duration) => {
-                        if verbose {
-                            eprintln!("timeout: sending signal SIGKILL to command '{}'", command);
-                        }
-
-                        let kill_sig = TimeoutSignal(Signal::SIGKILL);
-                        if foreground {
-                            kill_sig.send_to_process(child_pid)?;
-                        } else {
-                            kill_sig.send_to_group(child_pid)?;
-                        }
-
-                        let _ = sigchld.recv().await;
-                        metrics.elapsed = start_time.elapsed();
-                        metrics.exit_code = 128 + 9;
-                        metrics.log();
-
-                        128 + 9
-                    }
-                }
-            } else {
-                let _ = sigchld.recv().await;
-                metrics.elapsed = start_time.elapsed();
-
-                let code = match waitpid(child_pid, None) {
-                    Ok(WaitStatus::Exited(_, c)) => {
-                        if preserve_status { c } else { EXIT_TIMEDOUT }
-                    }
-                    Ok(WaitStatus::Signaled(_, sig, _)) => {
-                        if preserve_status { 128 + sig as i32 } else { EXIT_TIMEDOUT }
-                    }
-                    _ => EXIT_TIMEDOUT,
-                };
-
-                metrics.exit_code = code;
-                metrics.log();
-                code
-            }
-        }
-
-        _ = sigint.recv() => {
-            metrics.elapsed = start_time.elapsed();
-
-            let sig = TimeoutSignal(Signal::SIGINT);
-            if foreground {
-                sig.send_to_process(child_pid)?;
-            } else {
-                sig.send_to_group(child_pid)?;
-            }
-
-            let _ = sigchld.recv().await;
-            let code = match waitpid(child_pid, None) {
-                Ok(WaitStatus::Exited(_, c)) => c,
-                Ok(WaitStatus::Signaled(_, _, _)) => 128 + 2,
-                _ => 128 + 2,
-            };
-
-            metrics.exit_code = code;
-            metrics.signal_sent = Some(sig);
-            metrics.log();
-            code
-        }
-
-        _ = sigterm.recv() => {
-            metrics.elapsed = start_time.elapsed();
-
-            let sig = TimeoutSignal(Signal::SIGTERM);
-            if foreground {
-                sig.send_to_process(child_pid)?;
-            } else {
-                sig.send_to_group(child_pid)?;
-            }
-
-            let _ = sigchld.recv().await;
-            let code = match waitpid(child_pid, None) {
-                Ok(WaitStatus::Exited(_, c)) => c,
-                Ok(WaitStatus::Signaled(_, _, _)) => 128 + 15,
-                _ => 128 + 15,
-            };
-
-            metrics.exit_code = code;
-            metrics.signal_sent = Some(sig);
-            metrics.log();
-            code
-        }
-    };
-
-    Ok(exit_code)
 }
